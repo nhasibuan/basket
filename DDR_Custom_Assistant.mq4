@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                          DDR Custom Assistant (Refactored 3.0)   |
+//|                          DDR Custom Assistant (Refactored 4.0)   |
 //|                                       Copyright © 2024           |
 //|                                  https://wa.me/+628811230359     |
 //+------------------------------------------------------------------+
@@ -19,28 +19,32 @@
 //   3. Logger            - Print() helper with prefix
 //   4. Errors / Trade    - retry-safe close & modify wrappers
 //   5. OrderState        - data struct + reset/validate helpers
-//   6. Scanner           - finds extreme orders (No.1 / No.2)
+//   6. Scanner           - top-3 extremes per side (sorted lists)
 //   7. Pricing           - spread helpers (price delta + money cost)
 //   8. ATR Stop Loss     - profit-zone SL, spread- & StopLevel-aware
-//   9. Closer            - basket close (atomic-ish, retry, verified)
+//   9. Closer            - basket close (verified, retry, 1/tick)
 //  10. License           - account / expiry validation
 //  11. GUI               - dashboard build & update
 //  12. Lifecycle         - OnInit / OnDeinit / OnTick
 //
-//  STRATEGIES (legs are chosen from the Scanner result)
-//   1) BUY-BUY    PAIR   : buyHigh + buyLow(No.2)
-//   2) SELL-SELL  PAIR   : sellLow + sellHigh(No.2)
-//   3) SELL-BUY   TRIPLE : buyHigh + sellHigh(No.2) + sellHighAbs(No.1)
-//   4) BUY-SELL   TRIPLE : buyLow(No.2) + buyLowAbs(No.1) + sellLow
+//  EXTREME NAMING (1-based)
+//   Buys  sorted ascending : Lo(1)=lowest .. Lo(3)=3rd lowest ; High=highest
+//   Sells sorted descending: Hi(1)=highest .. Hi(3)=3rd highest; Low =lowest
 //
-//  ATR SL applied to: buyHigh, buyLow(No.2), sellLow, sellHigh(No.2).
-//  NOT applied to:    buyLowAbs(No.1), sellHighAbs(No.1)  (anchors).
+//  STRATEGIES (legs chosen from the Scanner result)
+//   1) BUY-BUY    PAIR   : buyHigh        + Lo(2)
+//   2) SELL-SELL  PAIR   : sellLow        + Hi(2)
+//   3) SELL-BUY   TRIPLE : Lo(2)          + Hi(2) + Hi(3)
+//   4) BUY-SELL   TRIPLE : Lo(2)          + Lo(3) + Hi(2)
 //
-//  CORRECTNESS NOTES (fixes vs. 2.0)
+//  ATR SL applied to: buyHigh, sellLow, Lo(2), Lo(3), Hi(2), Hi(3).
+//  NOT applied to    : Lo(1), Hi(1)  -> DISPLAY-ONLY ANCHORS (held).
+//
+//  CORRECTNESS NOTES
 //  ----------------------------------------------------------------
-//  * Strategies share legs (e.g. buyHigh is used by S1 and S3). To
-//    avoid acting on a stale snapshot, AT MOST ONE basket is closed
-//    per tick; after a close we return and re-scan on the next tick.
+//  * Strategies share legs (e.g. Lo(2) is used by S1/S3/S4). To avoid
+//    acting on a stale snapshot, AT MOST ONE basket is closed per
+//    tick; after a close we return and re-scan on the next tick.
 //  * Basket close verifies every leg and retries transient errors;
 //    partial closes are logged and re-evaluated next tick.
 //  * Stop-loss prices are normalized with NormalizeDouble().
@@ -51,7 +55,7 @@
 //+------------------------------------------------------------------+
 #property copyright  "Copyright © 2024"
 #property link       "https://wa.me/+628811230359"
-#property version    "3.00"
+#property version    "4.00"
 #property strict
 #property description "Manages existing orders. Pair/triple closes on combined profit."
 
@@ -59,27 +63,27 @@
 // 1. INPUTS
 //==================================================================
 input group "=== General ==="
-input int    InpMagicNumber   = 0;          // Magic filter (0 = all symbol orders)
-input int    InpSlippagePts    = 30;        // OrderClose slippage (points)
-input int    InpGuiUpdateSecs  = 1;         // GUI refresh interval (seconds)
-input int    InpRetryCount     = 3;         // Trade retry attempts on transient errors
-input int    InpRetryDelayMs   = 200;       // Delay between retries (ms, live only)
-input bool   InpAddSpreadBuffer= true;      // Add spread cost as a safety buffer to target
+input int    InpMagicNumber    = 0;         // Magic filter (0 = all symbol orders)
+input int    InpSlippagePts     = 30;       // OrderClose slippage (points)
+input int    InpGuiUpdateSecs   = 1;        // GUI refresh interval (seconds)
+input int    InpRetryCount      = 3;        // Trade retry attempts on transient errors
+input int    InpRetryDelayMs    = 200;      // Delay between retries (ms, live only)
+input bool   InpAddSpreadBuffer = true;     // Add spread cost as a safety buffer to target
 
 input group "=== Strategy 1: BUY-BUY (PAIR) ==="
-input bool   InpEnable_BB     = true;       // Enable BUY-BUY
-input double InpProfit_BB     = 1.5;        // Target $ per lot
+input bool   InpEnable_BB     = true;       // Enable BUY-BUY  : buyHigh + Lo(2)
+input double InpProfit_BB     = 0.5;        // Target $ per lot
 
 input group "=== Strategy 2: SELL-SELL (PAIR) ==="
-input bool   InpEnable_SS     = true;       // Enable SELL-SELL
-input double InpProfit_SS     = 1.5;        // Target $ per lot
+input bool   InpEnable_SS     = true;       // Enable SELL-SELL: sellLow + Hi(2)
+input double InpProfit_SS     = 0.5;        // Target $ per lot
 
 input group "=== Strategy 3: SELL-BUY (TRIPLE) ==="
-input bool   InpEnable_SB     = true;       // Enable SELL-BUY
+input bool   InpEnable_SB     = true;       // Enable SELL-BUY : Lo(2) + Hi(2) + Hi(3)
 input double InpProfit_SB     = 0.5;        // Target $ per lot
 
 input group "=== Strategy 4: BUY-SELL (TRIPLE) ==="
-input bool   InpEnable_BS     = true;       // Enable BUY-SELL
+input bool   InpEnable_BS     = true;       // Enable BUY-SELL : Lo(2) + Lo(3) + Hi(2)
 input double InpProfit_BS     = 0.5;        // Target $ per lot
 
 input group "=== ATR Stop Loss ==="
@@ -91,6 +95,9 @@ input double          InpATR_Multiplier = 1.0;      // ATR multiplier
 //==================================================================
 // 2. GLOBALS & CONSTANTS
 //==================================================================
+//--- Number of extremes tracked per side (Lo(1..3) / Hi(1..3)) ----
+#define TOPN 3
+
 //--- License (hard-coded; intentionally NOT input) ----------------
 const int    LIC_ACCOUNT_ID  = 0;            // 0 = any account
 const string LIC_EXPIRE_DATE = "2026.12.01"; // YYYY.MM.DD
@@ -262,26 +269,31 @@ void OrderState_FillFromCurrent(OrderState &s)
   }
 
 //==================================================================
-// 6. SCANNER
+// 6. SCANNER  (top-3 sorted lists per side)
 //==================================================================
 struct ScanResult
   {
-   OrderState        buyHigh;       // highest Buy
-   OrderState        buyLow;        // 2nd-lowest Buy (No.2, runner-up)
-   OrderState        buyLowAbs;     // lowest Buy (No.1, most extreme)
-   OrderState        sellLow;       // lowest Sell
-   OrderState        sellHigh;      // 2nd-highest Sell (No.2, runner-up)
-   OrderState        sellHighAbs;   // highest Sell (No.1, most extreme)
+   OrderState        buyHigh;            // highest Buy (used by S1)
+   OrderState        buyLow[TOPN];       // [0]=Lo(1) anchor, [1]=Lo(2), [2]=Lo(3)
+   OrderState        sellLow;            // lowest Sell (used by S2)
+   OrderState        sellHigh[TOPN];     // [0]=Hi(1) anchor, [1]=Hi(2), [2]=Hi(3)
   };
+
+//--- 1-based read-only accessors (copies) -------------------------
+//    BuyLo(r,1)=lowest buy, BuyLo(r,2)=2nd-lowest, BuyLo(r,3)=3rd.
+//    SellHi(r,1)=highest sell, SellHi(r,2)=2nd-highest, etc.
+OrderState BuyLo(ScanResult &r, const int n)  { return r.buyLow[n-1];  }
+OrderState SellHi(ScanResult &r, const int n) { return r.sellHigh[n-1]; }
 
 void Scanner_Init(ScanResult &r)
   {
-   OrderState_Reset(r.buyHigh,     0);
-   OrderState_Reset(r.buyLow,      DBL_MAX);
-   OrderState_Reset(r.buyLowAbs,   DBL_MAX);
-   OrderState_Reset(r.sellLow,     DBL_MAX);
-   OrderState_Reset(r.sellHigh,    0);
-   OrderState_Reset(r.sellHighAbs, 0);
+   OrderState_Reset(r.buyHigh, 0);
+   OrderState_Reset(r.sellLow, DBL_MAX);
+   for(int i = 0; i < TOPN; i++)
+     {
+      OrderState_Reset(r.buyLow[i],   DBL_MAX);
+      OrderState_Reset(r.sellHigh[i], 0);
+     }
   }
 
 bool Scanner_PassesFilter()
@@ -295,38 +307,39 @@ bool Scanner_PassesFilter()
    return true;
   }
 
-void Scanner_HandleBuy(ScanResult &r, const double price)
+// Generic insertion into a fixed-size sorted top-N list.
+// keepLowest = true  -> list sorted ascending  (lowest first)
+// keepLowest = false -> list sorted descending (highest first)
+void Scanner_InsertSorted(OrderState &list[], const int n,
+                          OrderState &cand, const bool keepLowest)
   {
-   // Highest Buy
-   if(price > r.buyHigh.price)
-      OrderState_FillFromCurrent(r.buyHigh);
-
-   // Two lowest Buys (rolling No.1 / No.2)
-   if(price < r.buyLowAbs.price)
+   for(int i = 0; i < n; i++)
      {
-      r.buyLow = r.buyLowAbs;             // demote old champion to runner-up
-      OrderState_FillFromCurrent(r.buyLowAbs);
+      const bool better = !list[i].IsValid() ||
+                          (keepLowest ? cand.price < list[i].price
+                                      : cand.price > list[i].price);
+      if(better)
+        {
+         for(int j = n - 1; j > i; j--)
+            list[j] = list[j - 1];   // shift tail down
+         list[i] = cand;
+         return;
+        }
      }
-   else
-      if(price < r.buyLow.price)
-         OrderState_FillFromCurrent(r.buyLow);
   }
 
-void Scanner_HandleSell(ScanResult &r, const double price)
+void Scanner_HandleBuy(ScanResult &r, OrderState &cand)
   {
-   // Lowest Sell
-   if(price < r.sellLow.price)
-      OrderState_FillFromCurrent(r.sellLow);
+   if(cand.price > r.buyHigh.price)
+      r.buyHigh = cand;
+   Scanner_InsertSorted(r.buyLow, TOPN, cand, true);   // lowest buys
+  }
 
-   // Two highest Sells (rolling No.1 / No.2)
-   if(price > r.sellHighAbs.price)
-     {
-      r.sellHigh = r.sellHighAbs;         // demote old champion to runner-up
-      OrderState_FillFromCurrent(r.sellHighAbs);
-     }
-   else
-      if(price > r.sellHigh.price)
-         OrderState_FillFromCurrent(r.sellHigh);
+void Scanner_HandleSell(ScanResult &r, OrderState &cand)
+  {
+   if(cand.price < r.sellLow.price)
+      r.sellLow = cand;
+   Scanner_InsertSorted(r.sellHigh, TOPN, cand, false); // highest sells
   }
 
 void Scanner_Run(ScanResult &r)
@@ -340,11 +353,12 @@ void Scanner_Run(ScanResult &r)
       if(!Scanner_PassesFilter())
          continue;
 
-      const double price = OrderOpenPrice();
-      if(OrderType() == OP_BUY)
-         Scanner_HandleBuy(r, price);
+      OrderState cand;
+      OrderState_FillFromCurrent(cand);
+      if(cand.type == OP_BUY)
+         Scanner_HandleBuy(r, cand);
       else
-         Scanner_HandleSell(r, price);
+         Scanner_HandleSell(r, cand);
      }
   }
 
@@ -434,12 +448,15 @@ void Atr_ApplyTo(OrderState &order)
    Trade_ModifyStopLoss(order.ticket, openPrice, newSL, isBuy);
   }
 
+// Applied to the working legs only; Lo(1)/Hi(1) anchors are excluded.
 void Atr_ApplyAll(ScanResult &r)
   {
-   Atr_ApplyTo(r.buyHigh);
-   Atr_ApplyTo(r.buyLow);
-   Atr_ApplyTo(r.sellLow);
-   Atr_ApplyTo(r.sellHigh);
+   Atr_ApplyTo(r.buyHigh);       // S1 leg
+   Atr_ApplyTo(r.sellLow);       // S2 leg
+   Atr_ApplyTo(r.buyLow[1]);     // Lo(2)
+   Atr_ApplyTo(r.buyLow[2]);     // Lo(3)
+   Atr_ApplyTo(r.sellHigh[1]);   // Hi(2)
+   Atr_ApplyTo(r.sellHigh[2]);   // Hi(3)
   }
 
 //==================================================================
@@ -527,15 +544,19 @@ bool Closer_TryTriple(OrderState &o1, OrderState &o2, OrderState &o3,
 
 // At most ONE basket per tick: after a close we return so the next
 // tick re-scans fresh state (legs are shared across strategies).
+//   S1 BUY-BUY  : buyHigh + Lo(2)
+//   S2 SELL-SELL: sellLow + Hi(2)
+//   S3 SELL-BUY : Lo(2) + Hi(2) + Hi(3)
+//   S4 BUY-SELL : Lo(2) + Lo(3) + Hi(2)
 void Strategies_Run(ScanResult &r)
   {
-   if(InpEnable_BB && Closer_TryPair(r.buyHigh, r.buyLow,   InpProfit_BB, "BUY-BUY"))
+   if(InpEnable_BB && Closer_TryPair(r.buyHigh, r.buyLow[1], InpProfit_BB, "BUY-BUY"))
       return;
-   if(InpEnable_SS && Closer_TryPair(r.sellLow, r.sellHigh, InpProfit_SS, "SELL-SELL"))
+   if(InpEnable_SS && Closer_TryPair(r.sellLow, r.sellHigh[1], InpProfit_SS, "SELL-SELL"))
       return;
-   if(InpEnable_SB && Closer_TryTriple(r.buyHigh, r.sellHigh, r.sellHighAbs, InpProfit_SB, "SELL-BUY"))
+   if(InpEnable_SB && Closer_TryTriple(r.buyLow[1], r.sellHigh[1], r.sellHigh[2], InpProfit_SB, "SELL-BUY"))
       return;
-   if(InpEnable_BS && Closer_TryTriple(r.buyLow,  r.buyLowAbs, r.sellLow,    InpProfit_BS, "BUY-SELL"))
+   if(InpEnable_BS && Closer_TryTriple(r.buyLow[1], r.buyLow[2], r.sellHigh[1], InpProfit_BS, "BUY-SELL"))
       return;
   }
 
@@ -596,6 +617,14 @@ void Gui_Build()
    Gui_CreateLabel("Spread", x, y, "Spread: ");
    y += GUI_LINE_H;
    Gui_CreateLabel("ATR",    x, y, "ATR: ", clrYellow);
+   y += GUI_LINE_H;
+
+   // Anchors (display only - never auto-closed)
+   Gui_CreateLabel("A_Title", x, y, "ANCHORS (hold):", clrOrange);
+   y += GUI_LINE_H;
+   Gui_CreateLabel("A_BL1",   x, y, "Buy  Lo(1) : ");
+   y += GUI_LINE_H;
+   Gui_CreateLabel("A_SH1",   x, y, "Sell Hi(1) : ");
    y += GUI_GROUP_H;
 
    const int yStrategiesStart = y;
@@ -603,18 +632,18 @@ void Gui_Build()
    // Left column
    Gui_CreateLabel("S1_Title", x, y, "STRATEGY 1: BUY-BUY",   clrAqua);
    y += GUI_LINE_H;
-   Gui_CreateLabel("S1_BH",    x, y, "Buy  High  : ");
+   Gui_CreateLabel("S1_L1",    x, y, "Buy  High  : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S1_BL",    x, y, "Buy  Lo(2) : ");
+   Gui_CreateLabel("S1_L2",    x, y, "Buy  Lo(2) : ");
    y += GUI_LINE_H;
    Gui_CreateLabel("S1_P",     x, y, "Profit     : $0.00");
    y += GUI_GROUP_H;
 
    Gui_CreateLabel("S2_Title", x, y, "STRATEGY 2: SELL-SELL", clrAqua);
    y += GUI_LINE_H;
-   Gui_CreateLabel("S2_SL",    x, y, "Sell Low   : ");
+   Gui_CreateLabel("S2_L1",    x, y, "Sell Low   : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S2_SH",    x, y, "Sell Hi(2) : ");
+   Gui_CreateLabel("S2_L2",    x, y, "Sell Hi(2) : ");
    y += GUI_LINE_H;
    Gui_CreateLabel("S2_P",     x, y, "Profit     : $0.00");
 
@@ -624,22 +653,22 @@ void Gui_Build()
 
    Gui_CreateLabel("S3_Title", x, y, "STRATEGY 3: SELL-BUY",  clrAqua);
    y += GUI_LINE_H;
-   Gui_CreateLabel("S3_BH",    x, y, "Buy  High  : ");
+   Gui_CreateLabel("S3_L1",    x, y, "Buy  Lo(2) : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S3_SH2",   x, y, "Sell Hi(2) : ");
+   Gui_CreateLabel("S3_L2",    x, y, "Sell Hi(2) : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S3_SH1",   x, y, "Sell Hi(1) : ");
+   Gui_CreateLabel("S3_L3",    x, y, "Sell Hi(3) : ");
    y += GUI_LINE_H;
    Gui_CreateLabel("S3_P",     x, y, "Profit     : $0.00");
    y += GUI_GROUP_H;
 
    Gui_CreateLabel("S4_Title", x, y, "STRATEGY 4: BUY-SELL",  clrAqua);
    y += GUI_LINE_H;
-   Gui_CreateLabel("S4_BL2",   x, y, "Buy  Lo(2) : ");
+   Gui_CreateLabel("S4_L1",    x, y, "Buy  Lo(2) : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S4_BL1",   x, y, "Buy  Lo(1) : ");
+   Gui_CreateLabel("S4_L2",    x, y, "Buy  Lo(3) : ");
    y += GUI_LINE_H;
-   Gui_CreateLabel("S4_SL",    x, y, "Sell Low   : ");
+   Gui_CreateLabel("S4_L3",    x, y, "Sell Hi(2) : ");
    y += GUI_LINE_H;
    Gui_CreateLabel("S4_P",     x, y, "Profit     : $0.00");
   }
@@ -665,31 +694,41 @@ void Gui_Update(ScanResult &r)
                                       DoubleToString(InpATR_Multiplier, 2),
                                       DoubleToString(atr * InpATR_Multiplier, _Digits)));
 
-   // Strategy 1: BUY-BUY (pair)
-   Gui_SetText("S1_BH", Gui_PriceText("Buy  High  : ", r.buyHigh));
-   Gui_SetText("S1_BL", Gui_PriceText("Buy  Lo(2) : ", r.buyLow));
-   const bool s1ok = r.buyHigh.IsValid() && r.buyLow.IsValid();
-   Gui_SetProfit("S1_P", s1ok ? r.buyHigh.profit + r.buyLow.profit : 0, s1ok);
+   // Anchors (display only) - using the public accessors.
+   OrderState aLo1 = BuyLo(r, 1);
+   OrderState aHi1 = SellHi(r, 1);
+   Gui_SetText("A_BL1", Gui_PriceText("Buy  Lo(1) : ", aLo1));
+   Gui_SetText("A_SH1", Gui_PriceText("Sell Hi(1) : ", aHi1));
 
-   // Strategy 2: SELL-SELL (pair)
-   Gui_SetText("S2_SL", Gui_PriceText("Sell Low   : ", r.sellLow));
-   Gui_SetText("S2_SH", Gui_PriceText("Sell Hi(2) : ", r.sellHigh));
-   const bool s2ok = r.sellLow.IsValid() && r.sellHigh.IsValid();
-   Gui_SetProfit("S2_P", s2ok ? r.sellLow.profit + r.sellHigh.profit : 0, s2ok);
+   // Strategy 1: BUY-BUY  (buyHigh + Lo(2))
+   OrderState lo2 = BuyLo(r, 2);
+   Gui_SetText("S1_L1", Gui_PriceText("Buy  High  : ", r.buyHigh));
+   Gui_SetText("S1_L2", Gui_PriceText("Buy  Lo(2) : ", lo2));
+   const bool s1ok = r.buyHigh.IsValid() && lo2.IsValid();
+   Gui_SetProfit("S1_P", s1ok ? r.buyHigh.profit + lo2.profit : 0, s1ok);
 
-   // Strategy 3: SELL-BUY (triple)
-   Gui_SetText("S3_BH",  Gui_PriceText("Buy  High  : ", r.buyHigh));
-   Gui_SetText("S3_SH2", Gui_PriceText("Sell Hi(2) : ", r.sellHigh));
-   Gui_SetText("S3_SH1", Gui_PriceText("Sell Hi(1) : ", r.sellHighAbs));
-   const bool s3ok = r.buyHigh.IsValid() && r.sellHigh.IsValid() && r.sellHighAbs.IsValid();
-   Gui_SetProfit("S3_P", s3ok ? r.buyHigh.profit + r.sellHigh.profit + r.sellHighAbs.profit : 0, s3ok);
+   // Strategy 2: SELL-SELL (sellLow + Hi(2))
+   OrderState hi2 = SellHi(r, 2);
+   Gui_SetText("S2_L1", Gui_PriceText("Sell Low   : ", r.sellLow));
+   Gui_SetText("S2_L2", Gui_PriceText("Sell Hi(2) : ", hi2));
+   const bool s2ok = r.sellLow.IsValid() && hi2.IsValid();
+   Gui_SetProfit("S2_P", s2ok ? r.sellLow.profit + hi2.profit : 0, s2ok);
 
-   // Strategy 4: BUY-SELL (triple)
-   Gui_SetText("S4_BL2", Gui_PriceText("Buy  Lo(2) : ", r.buyLow));
-   Gui_SetText("S4_BL1", Gui_PriceText("Buy  Lo(1) : ", r.buyLowAbs));
-   Gui_SetText("S4_SL",  Gui_PriceText("Sell Low   : ", r.sellLow));
-   const bool s4ok = r.buyLow.IsValid() && r.buyLowAbs.IsValid() && r.sellLow.IsValid();
-   Gui_SetProfit("S4_P", s4ok ? r.buyLow.profit + r.buyLowAbs.profit + r.sellLow.profit : 0, s4ok);
+   // Strategy 3: SELL-BUY (Lo(2) + Hi(2) + Hi(3))
+   OrderState hi3 = SellHi(r, 3);
+   Gui_SetText("S3_L1", Gui_PriceText("Buy  Lo(2) : ", lo2));
+   Gui_SetText("S3_L2", Gui_PriceText("Sell Hi(2) : ", hi2));
+   Gui_SetText("S3_L3", Gui_PriceText("Sell Hi(3) : ", hi3));
+   const bool s3ok = lo2.IsValid() && hi2.IsValid() && hi3.IsValid();
+   Gui_SetProfit("S3_P", s3ok ? lo2.profit + hi2.profit + hi3.profit : 0, s3ok);
+
+   // Strategy 4: BUY-SELL (Lo(2) + Lo(3) + Hi(2))
+   OrderState lo3 = BuyLo(r, 3);
+   Gui_SetText("S4_L1", Gui_PriceText("Buy  Lo(2) : ", lo2));
+   Gui_SetText("S4_L2", Gui_PriceText("Buy  Lo(3) : ", lo3));
+   Gui_SetText("S4_L3", Gui_PriceText("Sell Hi(2) : ", hi2));
+   const bool s4ok = lo2.IsValid() && lo3.IsValid() && hi2.IsValid();
+   Gui_SetProfit("S4_P", s4ok ? lo2.profit + lo3.profit + hi2.profit : 0, s4ok);
 
    ChartRedraw(0);
   }
@@ -747,7 +786,7 @@ void OnTick()
    ScanResult r;
    Scanner_Run(r);
 
-   // ATR profit-lock SL (No.1 anchors are intentionally excluded).
+   // ATR profit-lock SL (Lo(1)/Hi(1) anchors are intentionally excluded).
    Atr_ApplyAll(r);
 
    // Dashboard (throttled).
