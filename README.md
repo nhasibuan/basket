@@ -1,2 +1,2 @@
-# basket
+# Basket
 Basket manager
